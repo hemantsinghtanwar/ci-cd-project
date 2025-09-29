@@ -1,0 +1,115 @@
+name: 🚀 Auto Deploy Pipeline
+
+on:
+  push:
+    branches: [ "**" ]
+    branches-ignore: [ main ]
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+jobs:
+  deploy-preview:
+    name: 🎯 Deploy Preview - ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref != 'refs/heads/main'
+
+    steps:
+    - name: 🔍 Checkout code
+      uses: actions/checkout@v4
+
+    - name: ⚙️ Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22.11'
+        cache: ''
+
+    - name: 🏷️ Generate subdomain
+      id: subdomain
+      run: |
+        BRANCH_NAME="${{ github.ref_name }}"
+        SANITIZED_BRANCH=$(echo "$BRANCH_NAME" | sed 's/[^a-zA-Z0-9]/-/g' | tr '[:upper:]' '[:lower:]')
+        echo "subdomain=preview-$SANITIZED_BRANCH" >> $GITHUB_OUTPUT
+
+    - name: 🔑 Setup SSH
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts
+
+    - name: 🚀 Deploy to Server
+      run: |
+        ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} << 'EOF'
+        set -e
+        BRANCH_NAME="${{ github.ref_name }}"
+        APP_NAME="${{ steps.subdomain.outputs.subdomain }}"
+        APP_DIR="/var/www/$APP_NAME"
+        
+        echo "🚀 Deploying: $BRANCH_NAME"
+        PORT=$(/opt/scripts/port_manager.sh)
+        
+        mkdir -p $APP_DIR
+        cd $APP_DIR
+        rm -rf ./*
+        git clone -b $BRANCH_NAME https://github.com/${{ github.repository }}.git .
+        npm install
+        pm2 delete $APP_NAME 2>/dev/null || true
+        PORT=$PORT pm2 start npm --name "$APP_NAME" -- run start
+        pm2 save
+        /opt/scripts/create_nginx_config.sh $APP_NAME $PORT
+        
+        echo "✅ Preview: http://$APP_NAME.${{ secrets.BASE_DOMAIN }}"
+        EOF
+
+  deploy-production:
+    name: 🏭 Deploy to Production
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.merged == true
+
+    steps:
+    - name: 🔍 Checkout code
+      uses: actions/checkout@v4
+
+    - name: ⚙️ Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22.11'
+        cache: ''
+
+    - name: 🏷️ Generate production subdomain
+      id: prod-subdomain
+      run: |
+        PR_NUMBER=${{ github.event.pull_request.number }}
+        echo "subdomain=pr$PR_NUMBER" >> $GITHUB_OUTPUT
+
+    - name: 🔑 Setup SSH
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts
+
+    - name: 🚀 Deploy to Production
+      run: |
+        ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} << 'EOF'
+        set -e
+        PR_NUMBER=${{ github.event.pull_request.number }}
+        APP_NAME="pr$PR_NUMBER"
+        APP_DIR="/var/www/$APP_NAME"
+        
+        echo "🏭 Deploying PR #$PR_NUMBER"
+        PORT=$(/opt/scripts/port_manager.sh)
+        
+        mkdir -p $APP_DIR
+        cd $APP_DIR
+        rm -rf ./*
+        git clone https://github.com/${{ github.repository }}.git .
+        npm install
+        pm2 delete $APP_NAME 2>/dev/null || true
+        PORT=$PORT pm2 start npm --name "$APP_NAME" -- run start
+        pm2 save
+        /opt/scripts/create_nginx_config.sh $APP_NAME $PORT
+        
+        echo "✅ Production: http://$APP_NAME.${{ secrets.BASE_DOMAIN }}"
+        EOF
